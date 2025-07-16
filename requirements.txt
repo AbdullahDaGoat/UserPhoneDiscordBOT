@@ -1,0 +1,3 @@
+discord.py==2.3.2        # Core Discord library
+python-dotenv==1.0.1     # Optional: load .env file in local dev
+aiofiles==23.2.1         # Handles async file I/O for large attachments
