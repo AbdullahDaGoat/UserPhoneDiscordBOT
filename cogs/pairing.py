@@ -1,5 +1,8 @@
-# cogs/pairing.py  –  drop‑in replacement
-import asyncio, time, traceback
+# cogs/pairing.py
+
+import asyncio
+import time
+import traceback
 from typing import Optional
 
 import discord
@@ -19,78 +22,100 @@ class Pairing(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.user_queue: dict[int, int] = {}        # user_id  -> channel_id
-        self.queue_msg:  dict[int, int] = {}        # channel_id -> placeholder id
-        self.guild_usage: dict[int, tuple[int,int]] = {}  # guild_id -> (count, reset_ts)
+        # maps user_id -> channel_id for queued callers
+        self.user_queue: dict[int, int] = {}
+        # maps channel_id -> placeholder message ID
+        self.queue_msg: dict[int, int] = {}
+        # per-guild rate-limit state
+        self.guild_usage: dict[int, tuple[int,int]] = {}
 
     # ───────────────────── helpers ─────────────────────
     async def _edit(self, cid: int, text: str):
-        """Edit stored placeholder for channel `cid`."""
+        """Edit the stored placeholder for channel `cid`."""
         mid = self.queue_msg.get(cid)
         if not mid:
             return
         ch = self.bot.get_channel(cid)
         try:
-            m = await ch.fetch_message(mid)
-            await m.edit(content=text)
+            msg = await ch.fetch_message(mid)
+            await msg.edit(content=text)
         except Exception:
             pass
+        # once connected or ended, drop the placeholder
         if text.startswith(("☎️", "📴", "❌")):
             self.queue_msg.pop(cid, None)
 
     async def _pair(self, ch1: discord.TextChannel, ch2: discord.TextChannel, anon: bool):
+        """Wire two channels together and flip placeholders."""
         await state.start_call(ch1.id, ch2.id, anon)
         await self._edit(ch1.id, "☎️ Connected!")
         await self._edit(ch2.id, "☎️ Connected!")
 
     # ───────────────────── core handler ─────────────────────
     async def _handle_call(self, inter: discord.Interaction, anon: bool):
-        ch  = inter.channel
-        uid = inter.user.id
+        ch, uid = inter.channel, inter.user.id
 
-        # 0️⃣ channel type check *before* we defer
+        # 0️⃣ only in text channels
         if not isinstance(ch, discord.TextChannel):
-            return await inter.response.send_message("Use this in a text channel.", ephemeral=True)
+            return await inter.response.send_message(
+                "Use this in a text channel.", ephemeral=True
+            )
 
-        # 1️⃣ ACK – from now on Discord will never time‑out
-        await inter.response.defer(thinking=True)   # non‑ephemeral placeholder
+        # ▶️ Prevent two callers in the same channel
+        if ch.id in self.user_queue.values() and self.user_queue.get(uid) != ch.id:
+            return await inter.response.send_message(
+                "This channel is already used by another caller. Please run `/call` in a different channel.",
+                ephemeral=True,
+            )
+
+        # 1️⃣ ACK to avoid Discord timeouts
+        await inter.response.defer(thinking=True)
 
         try:
-            # 2️⃣ lightweight guards ───────────────────────────
+            # 2️⃣ lightweight guards
             if await state.is_in_call(ch.id):
-                return await inter.edit_original_response(content="This channel is already in a call.")
+                return await inter.edit_original_response(
+                    content="This channel is already in a live call."
+                )
+            if uid in self.user_queue and self.user_queue[uid] == ch.id:
+                return await inter.edit_original_response(
+                    content="You're already waiting here."
+                )
+            if uid in self.user_queue.values() and self.user_queue.get(uid) != ch.id:
+                return await inter.edit_original_response(
+                    content="You have another pending call elsewhere."
+                )
 
-            if uid in self.user_queue:
-                return await inter.edit_original_response(content="You're already queued elsewhere.")
-
-            # per‑guild quota
+            # per-server rate limit
             if inter.guild:
-                gid   = inter.guild.id
-                used, reset = self.guild_usage.get(gid, (0, time.time()+self.SERVER_WINDOW))
+                gid = inter.guild.id
+                used, reset = self.guild_usage.get(gid, (0, time.time() + self.SERVER_WINDOW))
                 now = time.time()
                 if now > reset:
                     used, reset = 0, now + self.SERVER_WINDOW
                 if used >= self.SERVER_LIMIT:
                     return await inter.edit_original_response(
-                        content=f"🚦 This server hit the {self.SERVER_LIMIT}/h call limit."
+                        content=f"🚦 This server hit the {self.SERVER_LIMIT}/h limit."
                     )
-                self.guild_usage[gid] = (used+1, reset)
+                self.guild_usage[gid] = (used + 1, reset)
 
-            # 3️⃣ matching / queue bookkeeping ─────────────────
+            # 3️⃣ queue bookkeeping
+            # mark this user as queued on this channel
             self.user_queue[uid] = ch.id
             queue = state.anon_queue if anon else state.waiting_queue
 
-            # look for partner
-            partner_cid = None
+            # attempt to find a partner from a different guild
+            partner_cid: Optional[int] = None
             for _ in range(len(queue)):
                 candidate = queue[0]
-                owner_uid = next((u for u,cid in self.user_queue.items() if cid == candidate), None)
-                if owner_uid and owner_uid != uid:
+                owner = next((u for u, cid in self.user_queue.items() if cid == candidate), None)
+                candidate_ch = self.bot.get_channel(candidate)
+                if owner and owner != uid and candidate_ch and candidate_ch.guild.id != ch.guild.id:
                     partner_cid = queue.popleft()
                     break
                 queue.rotate(-1)
 
-            # instant match?
+            # instant match
             if partner_cid:
                 msg = await inter.edit_original_response(content="🔗 Connecting…")
                 self.queue_msg[ch.id] = msg.id
@@ -98,10 +123,10 @@ class Pairing(commands.Cog):
                 await self._pair(ch, partner_ch, anon)
                 return
 
-            # else enqueue
+            # else, enqueue
             queue.append(ch.id)
-            pos  = len(queue)
-            msg  = await inter.edit_original_response(
+            pos = len(queue)
+            msg = await inter.edit_original_response(
                 content=f"📞 Calling… you're **#{pos}** in line."
             )
             self.queue_msg[ch.id] = msg.id
@@ -109,7 +134,7 @@ class Pairing(commands.Cog):
         except Exception:
             traceback.print_exc()
             await inter.edit_original_response(
-                content="⚠️ Unexpected error – try again in a moment."
+                content="⚠️ Unexpected error – please try again shortly."
             )
 
     # ───────────────────── slash commands ─────────────────────
@@ -129,7 +154,7 @@ class Pairing(commands.Cog):
 
         await inter.response.defer(ephemeral=True)
 
-        # 1) live call?
+        # 1️⃣ live call?
         partner_id = await state.end_call(ch.id)
         if partner_id:
             await self._edit(ch.id,      "📴 Ended.")
@@ -143,7 +168,7 @@ class Pairing(commands.Cog):
             )
             return await inter.edit_original_response(content="Call ended.")
 
-        # 2) queued?
+        # 2️⃣ queued?
         queued_cid = self.user_queue.pop(uid, None)
         if queued_cid:
             for q in (state.waiting_queue, state.anon_queue):
@@ -154,7 +179,7 @@ class Pairing(commands.Cog):
 
         await inter.edit_original_response(content="You're not in a call or queue.")
 
-    # —— misc —— 
+    # ───── misc ─────
     @app_commands.command(name="duration", description="Show current call duration")
     async def duration(self, inter: discord.Interaction):
         ch = inter.channel
@@ -162,9 +187,7 @@ class Pairing(commands.Cog):
             return await inter.response.send_message("Use in text channel.", ephemeral=True)
         mins = await state.get_call_duration(ch.id)
         if mins is None:
-            return await inter.response.send_message(
-                "This channel isn't in a call.", ephemeral=True
-            )
+            return await inter.response.send_message("This channel isn't in a call.", ephemeral=True)
         await inter.response.send_message(f"⏱️ {mins} minute(s) connected.", ephemeral=True)
 
     @app_commands.command(name="settings", description="Set alias / avatar")

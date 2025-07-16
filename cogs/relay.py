@@ -33,11 +33,9 @@ class Relay(commands.Cog):
             return
         
         # Get partner channel from active calls
-        partner_id = None
         if state._r:
-            partner = await state._r.hget(state._H_ACTIVE, str(cid))
-            if partner:
-                partner_id = int(partner)
+            partner_str = await state._r.hget(state._H_ACTIVE, str(cid))
+            partner_id  = int(partner_str) if partner_str else None
         else:
             partner_id = state.active_calls.get(cid)
         
@@ -54,30 +52,29 @@ class Relay(commands.Cog):
         # Handle attachments
         files = [await a.to_file() for a in msg.attachments]
         
-        # Handle stickers, including animated GIFs
+        # Handle stickers, preserving GIF animation
         if msg.stickers:
             async with aiohttp.ClientSession() as session:
                 for st in msg.stickers:
                     try:
                         async with session.get(st.url) as resp:
-                            buf = io.BytesIO(await resp.read())
-                            ctype = resp.headers.get("Content-Type", "")
-                            if "gif" in ctype:
+                            data = io.BytesIO(await resp.read())
+                            # Choose extension based on sticker format
+                            if st.format is discord.StickerFormatType.gif:
                                 ext = "gif"
-                            elif "webp" in ctype:
-                                ext = "webp"
+                            elif st.format is discord.StickerFormatType.apng:
+                                ext = "png"
                             else:
                                 ext = "png"
-                            files.append(discord.File(buf, filename=f"{st.id}.{ext}"))
+                            files.append(discord.File(data, filename=f"{st.id}.{ext}"))
                     except Exception:
-                        # skip any sticker that fails to fetch
                         continue
         
         if not msg.content and not files:
             return
         
-        partner = self.bot.get_channel(partner_id)
-        if not partner:
+        partner_ch = self.bot.get_channel(partner_id)
+        if not partner_ch:
             return
         
         # Get user info
@@ -90,12 +87,12 @@ class Relay(commands.Cog):
             lp_key = (msg.author.id, partner_id)
             prev = self.last_profile.get(lp_key, (None, None))
             if (alias, avatar) != prev:
-                self.last_profile[lp_key] = (alias, avatar)
                 if prev[0] is not None:
-                    await partner.send(f"ℹ️ **{prev[0]}** updated their profile.")
+                    await partner_ch.send(f"ℹ️ **{prev[0]}** updated their profile.")
+                self.last_profile[lp_key] = (alias, avatar)
         
         # Forward message
-        dest_msg = await forward_message(msg.content, files, alias, avatar, partner)
+        dest_msg = await forward_message(msg.content, files, alias, avatar, partner_ch)
         self.relay_map[(cid, msg.id)] = dest_msg.id
     
     @commands.Cog.listener()
@@ -109,11 +106,9 @@ class Relay(commands.Cog):
             return
         
         # Get partner channel
-        partner_id = None
         if state._r:
-            partner = await state._r.hget(state._H_ACTIVE, str(src_ch.id))
-            if partner:
-                partner_id = int(partner)
+            partner_str = await state._r.hget(state._H_ACTIVE, str(src_ch.id))
+            partner_id  = int(partner_str) if partner_str else None
         else:
             partner_id = state.active_calls.get(src_ch.id)
         
@@ -149,11 +144,9 @@ class Relay(commands.Cog):
             return
         
         # Get partner channel
-        partner_id = None
         if state._r:
-            partner = await state._r.hget(state._H_ACTIVE, str(cid))
-            if partner:
-                partner_id = int(partner)
+            partner_str = await state._r.hget(state._H_ACTIVE, str(cid))
+            partner_id  = int(partner_str) if partner_str else None
         else:
             partner_id = state.active_calls.get(cid)
         
