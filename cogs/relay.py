@@ -1,9 +1,11 @@
+# cogs/relay.py
+
 import aiohttp
 import io
 import discord
 from discord.ext import commands
 
-from utils.state import state
+from utils.state    import state
 from utils.webhooks import forward_message
 
 class Relay(commands.Cog):
@@ -11,6 +13,12 @@ class Relay(commands.Cog):
     
     def __init__(self, bot):
         self.bot = bot
+        # For rate limiting (fallback when not using Redis)
+        self.last_sent = {}
+        # For tracking profile changes
+        self.last_profile = {}
+        # For message edit mapping
+        self.relay_map = {}
     
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message):
@@ -19,27 +27,51 @@ class Relay(commands.Cog):
             return
         
         cid = msg.channel.id
-        partner_id = state.active_calls.get(cid)
+        
+        # Check if channel is in a call
+        if not await state.is_in_call(cid):
+            return
+        
+        # Get partner channel from active calls
+        partner_id = None
+        if state._r:
+            partner = await state._r.hget(state._H_ACTIVE, str(cid))
+            if partner:
+                partner_id = int(partner)
+        else:
+            partner_id = state.active_calls.get(cid)
+        
         if not partner_id:
             return
         
         # Rate limiting
         now = msg.created_at.timestamp()
-        if now - state.last_sent.get(msg.author.id, 0) < state.COOLDOWN:
+        last = self.last_sent.get(msg.author.id, 0)
+        if now - last < state.COOLDOWN:
             return
-        state.last_sent[msg.author.id] = now
+        self.last_sent[msg.author.id] = now
         
         # Handle attachments
         files = [await a.to_file() for a in msg.attachments]
         
-        # Handle stickers
+        # Handle stickers, including animated GIFs
         if msg.stickers:
-            for st in msg.stickers:
-                if st.format in (discord.StickerFormatType.png, discord.StickerFormatType.apng):
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(st.url) as response:
-                            data = io.BytesIO(await response.read())
-                            files.append(discord.File(data, filename=f"{st.id}.png"))
+            async with aiohttp.ClientSession() as session:
+                for st in msg.stickers:
+                    try:
+                        async with session.get(st.url) as resp:
+                            buf = io.BytesIO(await resp.read())
+                            ctype = resp.headers.get("Content-Type", "")
+                            if "gif" in ctype:
+                                ext = "gif"
+                            elif "webp" in ctype:
+                                ext = "webp"
+                            else:
+                                ext = "png"
+                            files.append(discord.File(buf, filename=f"{st.id}.{ext}"))
+                    except Exception:
+                        # skip any sticker that fails to fetch
+                        continue
         
         if not msg.content and not files:
             return
@@ -49,22 +81,22 @@ class Relay(commands.Cog):
             return
         
         # Get user info
-        anon = state.is_anonymous(cid)
-        alias = state.alias_for(msg.author, anon)
-        avatar = state.avatar_for(msg.author, anon)
+        anon   = await state.is_anonymous(cid)
+        alias  = await state.alias_for(msg.author, anon)
+        avatar = await state.avatar_for(msg.author, anon)
         
         # Check for profile changes (non-anon only)
         if not anon:
             lp_key = (msg.author.id, partner_id)
-            prev = state.last_profile.get(lp_key, (None, None))
+            prev = self.last_profile.get(lp_key, (None, None))
             if (alias, avatar) != prev:
-                state.last_profile[lp_key] = (alias, avatar)
-                if prev[0] is not None:  # Not first message
+                self.last_profile[lp_key] = (alias, avatar)
+                if prev[0] is not None:
                     await partner.send(f"ℹ️ **{prev[0]}** updated their profile.")
         
         # Forward message
         dest_msg = await forward_message(msg.content, files, alias, avatar, partner)
-        state.relay_map[(cid, msg.id)] = dest_msg.id
+        self.relay_map[(cid, msg.id)] = dest_msg.id
     
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
@@ -73,11 +105,22 @@ class Relay(commands.Cog):
         if not isinstance(src_ch, discord.TextChannel):
             return
         
-        partner_id = state.active_calls.get(src_ch.id)
+        if not await state.is_in_call(src_ch.id):
+            return
+        
+        # Get partner channel
+        partner_id = None
+        if state._r:
+            partner = await state._r.hget(state._H_ACTIVE, str(src_ch.id))
+            if partner:
+                partner_id = int(partner)
+        else:
+            partner_id = state.active_calls.get(src_ch.id)
+        
         if not partner_id:
             return
         
-        dest_id = state.relay_map.get((src_ch.id, payload.message_id))
+        dest_id = self.relay_map.get((src_ch.id, payload.message_id))
         if not dest_id:
             return
         
@@ -86,8 +129,6 @@ class Relay(commands.Cog):
             return
         
         content = payload.data.get("content", "")
-        
-        # Don't mirror if content becomes empty (embed-only edits)
         if content == "":
             return
         
@@ -104,7 +145,18 @@ class Relay(commands.Cog):
             return
         
         cid = payload.channel_id
-        partner_id = state.active_calls.get(cid)
+        if not await state.is_in_call(cid):
+            return
+        
+        # Get partner channel
+        partner_id = None
+        if state._r:
+            partner = await state._r.hget(state._H_ACTIVE, str(cid))
+            if partner:
+                partner_id = int(partner)
+        else:
+            partner_id = state.active_calls.get(cid)
+        
         if not partner_id:
             return
         
@@ -112,19 +164,17 @@ class Relay(commands.Cog):
         if not isinstance(partner_ch, discord.TextChannel):
             return
         
-        # Get user info
-        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
+        guild  = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
         member = guild.get_member(payload.user_id) if guild else None
-        user = member or payload.member or payload.user
-        
+        user   = member or payload.member or payload.user
         if not user:
             return
         
-        alias = state.alias_for(user, state.is_anonymous(cid))
+        alias = await state.alias_for(user, await state.is_anonymous(cid))
         
         # Get message snippet
         try:
-            src_ch = self.bot.get_channel(cid)
+            src_ch  = self.bot.get_channel(cid)
             src_msg = await src_ch.fetch_message(payload.message_id)
             snippet = (src_msg.content or "[non‑text]")[:60]
             if len(src_msg.content) > 60:
@@ -133,3 +183,6 @@ class Relay(commands.Cog):
             snippet = "a message"
         
         await partner_ch.send(f"**{alias}** reacted with {payload.emoji} to \"{snippet}\"")
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Relay(bot))
